@@ -14,6 +14,7 @@ from jupyter_events import EventLogger
 from jupyter_ydoc import ydocs as YDOCS
 from pycrdt import (
     Channel,
+    Decoder,
     Doc,
     Encoder,
 )
@@ -26,10 +27,34 @@ from .utils import JUPYTER_COLLABORATION_EVENTS_URI, LogLevel, MessageType, OutO
 YFILE = YDOCS["file"]
 
 
+def own_updates(ydoc: Doc) -> bytes:
+    """Encode every update made by the local client of a document.
+
+    Args:
+        ydoc: The document.
+
+    Returns:
+        An update with all the items of `ydoc.client_id`, from clock 0, and the document's
+        delete set.
+    """
+    decoder = Decoder(ydoc.get_state())
+    state = {
+        decoder.read_var_uint(): decoder.read_var_uint() for _ in range(decoder.read_var_uint())
+    }
+    state.pop(ydoc.client_id, None)
+    encoder = Encoder()
+    encoder.write_var_uint(len(state))
+    for client_id, clock in state.items():
+        encoder.write_var_uint(client_id)
+        encoder.write_var_uint(clock)
+    return ydoc.get_update(encoder.to_bytes())
+
+
 class DocumentRoom(YRoom):
     """A Y room for a possibly stored document (e.g. a notebook)."""
 
     _background_tasks: set[asyncio.Task]
+    ydoc_observed_timeout: float = 5
 
     def __init__(
         self,
@@ -158,6 +183,10 @@ class DocumentRoom(YRoom):
                     )
                     read_from_source = False
                     loaded_from_store = True
+                    if self._document.path != self._file.path:
+                        # The stored path is stale (e.g. renamed while closed). Writing it
+                        # again after loading makes it win over the stored value.
+                        self._document.path = self._file.path
                 except YDocNotFound:
                     # YDoc not found in the YStore, create the document from
                     # the source file (no change history)
@@ -214,8 +243,10 @@ class DocumentRoom(YRoom):
                         ):
                             raise exc
                         self.ready = True
-                        await self.ydoc_observed.wait()
-                        finish.set()
+                        try:
+                            await self._wait_for_ydoc_observed()
+                        finally:
+                            finish.set()
                         self._emit(LogLevel.INFO, "initialize", "Room initialized")
                         return
                     else:
@@ -223,14 +254,70 @@ class DocumentRoom(YRoom):
                 else:
                     await self._aset_preserving_session(model["content"])
 
-                if self.ystore:
-                    await self.ystore.encode_state_as_update(self.ydoc)
+            # The content now matches the file; a stored flag may come from an older session.
+            if self._document.dirty:
+                self._document.dirty = False
 
             self.ready = True
+            await self._wait_for_ydoc_observed()
+            await self._save_to_store(full=read_from_source)
             self._emit(LogLevel.INFO, "initialize", "Room initialized")
         finally:
             if release_update_lock:
                 self._update_lock.release()
+
+    async def _save_to_store(self, full: bool) -> None:
+        """Save to the store the writes it misses.
+
+        The store only records updates once the room observes them, so it misses the room's
+        earlier writes (e.g. the path set in the constructor). Without them, Yjs clients would
+        ignore everything this room's client writes. This runs after waiting for the room to
+        observe updates (see `_wait_for_ydoc_observed`), so it also covers the writes made while
+        waiting.
+
+        Like the recorded updates, the save is best effort: a failure is logged and does not
+        fail opening the document.
+
+        Args:
+            full: Save the whole document. Otherwise, only save this room's own writes, which is
+                enough when the document was loaded from the store.
+        """
+        if self.ystore is None:
+            return
+        try:
+            if full:
+                await self.ystore.encode_state_as_update(self.ydoc)
+            else:
+                await self.ystore.write(own_updates(self.ydoc))
+        except Exception as e:
+            self.log.error("Could not save room %s to the store", self._room_id, exc_info=e)
+
+    async def _wait_for_ydoc_observed(self) -> None:
+        """Wait until the room records document updates, so that no write after `ready` is lost.
+
+        Does not wait if the room is not running, and stops waiting when the room stops or after
+        `ydoc_observed_timeout` seconds (e.g. room tasks cancelled at server shutdown), so that
+        opening a document can't hang.
+        """
+        if not self.started.is_set() or self._stopped.is_set():
+            return
+        observed = asyncio.create_task(self.ydoc_observed.wait())
+        stopped = asyncio.create_task(self._stopped.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {observed, stopped},
+                timeout=self.ydoc_observed_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            observed.cancel()
+            stopped.cancel()
+        if not done:
+            self.log.warning(
+                "Room %s does not record updates after %s s; later updates may not be stored",
+                self._room_id,
+                self.ydoc_observed_timeout,
+            )
 
     async def _finish_progressive_initialization(
         self, content: Any, initialized: asyncio.Event, finish: asyncio.Event
